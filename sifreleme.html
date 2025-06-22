@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <title>Deterministik AES-GCM Şifreleme (Secret Phrase ile)</title>
+  <style>
+    body {
+      background: #1e1e1e;
+      color: #e0e0e0;
+      font-family: Arial, sans-serif;
+      padding: 20px;
+    }
+    h1, h2 {
+      color: #ffcc00;
+    }
+    .section {
+      background: #2a2a2a;
+      padding: 15px;
+      margin-bottom: 25px;
+      border-radius: 6px;
+      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.5);
+    }
+    label {
+      display: block;
+      margin-top: 10px;
+      margin-bottom: 4px;
+    }
+    input[type="password"], input[type="text"], textarea {
+      width: 100%;
+      padding: 8px;
+      font-size: 1rem;
+      border: 1px solid #444;
+      border-radius: 4px;
+      background: #333;
+      color: #e0e0e0;
+    }
+    textarea {
+      resize: vertical;
+      min-height: 60px;
+    }
+    button {
+      margin-top: 12px;
+      padding: 10px 18px;
+      background: #ff8800;
+      color: #1e1e1e;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 1rem;
+    }
+    button:hover {
+      background: #e67600;
+    }
+    #outputEncrypted, #outputDecrypted {
+      margin-top: 8px;
+      padding: 10px;
+      background: #333;
+      border: 1px solid #555;
+      border-radius: 4px;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .error {
+      margin-top: 8px;
+      color: #ff6666;
+    }
+    #qrCanvas {
+      margin-top: 10px;
+      display: none;
+    }
+    .download-link {
+      display: inline-block;
+      margin-top: 8px;
+      color: #66ccff;
+      text-decoration: underline;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <h1>🔐 Deterministik AES-GCM Şifreleme</h1>
+  <p>Gizli cümlenizden deterministik salt+IV türeterek tek bir gerçek şifreyi saklayın. Aynı girdiler için çıktı hep aynı olur.</p>
+  <p style="color: #ff6666;">UYARI: Tek bir şifre için, tek gizli cümleyle kullanın. Birden fazla farklı şifreniz varsa her biri için farklı gizli cümle ya da rastgele salt/IV kullanan yöntem tercih edin.</p>
+
+  <div class="section" id="encryptSection">
+    <h2>1. Şifrele (Encrypt Real Password)</h2>
+    <label for="secretPhrase">Gizli Cümle (Secret Phrase):</label>
+    <input type="password" id="secretPhrase" placeholder="Türkçe karakter içeren akılda kalıcı cümle">
+
+    <label for="realPassword">Gerçek Şifre (Real Password):</label>
+    <input type="text" id="realPassword" placeholder="Karmaşık, güçlü şifrenizi buraya yazın">
+
+    <button id="encryptBtn">Şifrele ve Çıktıyı Göster (Deterministik)</button>
+
+    <div id="encryptStatus" class="error"></div>
+    <h3>Şifrelenmiş Çıktı (ciphertext Base64):</h3>
+    <div id="outputEncrypted"></div>
+    <canvas id="qrCanvas"></canvas>
+    <div id="qrError" class="error"></div>
+    <div id="downloadArea"></div>
+  </div>
+
+  <div class="section" id="decryptSection">
+    <h2>2. Şifre Çöz (Decrypt to Retrieve Real Password)</h2>
+    <label for="encryptedInput">Şifrelenmiş Metin (ciphertext Base64):</label>
+    <textarea id="encryptedInput" placeholder="Buraya sakladığınız ciphertext Base64 değerini yapıştırın"></textarea>
+
+    <label for="secretPhraseDecrypt">Gizli Cümle (Secret Phrase):</label>
+    <input type="password" id="secretPhraseDecrypt" placeholder="Aynı gizli cümlenizi tekrar girin">
+
+    <button id="decryptBtn">Şifreyi Çöz ve Gerçek Şifreyi Göster</button>
+    <div id="decryptStatus" class="error"></div>
+    <h3>Geri Alınan Gerçek Şifre:</h3>
+    <div id="outputDecrypted"></div>
+  </div>
+
+  <!-- QRious CDN: opsiyonel, internet varsa QR kod için -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrious/4.0.2/qrious.min.js"></script>
+  <script>
+    // Utility: ArrayBuffer <-> Base64
+    function arrayBufferToBase64(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      return btoa(binary);
+    }
+    function base64ToArrayBuffer(base64) {
+      const binary = atob(base64);
+      const len = binary.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes.buffer;
+    }
+
+    // SHA-256: ArrayBuffer → ArrayBuffer
+    async function sha256(bufferOrString) {
+      let data;
+      if (typeof bufferOrString === 'string') {
+        data = new TextEncoder().encode(bufferOrString);
+      } else if (bufferOrString instanceof ArrayBuffer) {
+        data = new Uint8Array(bufferOrString);
+      } else if (bufferOrString instanceof Uint8Array) {
+        data = bufferOrString;
+      } else {
+        throw new Error('sha256: unsupported input type');
+      }
+      const hashBuf = await crypto.subtle.digest('SHA-256', data);
+      return hashBuf; // ArrayBuffer of length 32
+    }
+
+    // Gizli cümleden deterministik salt ve IV türet
+    async function deriveSaltAndIv(secretPhrase) {
+      // SHA-256(secretPhrase)
+      const hashBuf = await sha256(secretPhrase);
+      const hashBytes = new Uint8Array(hashBuf); // length 32
+      const salt = hashBytes.slice(0, 16);       // 16 bayt
+      const iv = hashBytes.slice(16, 28);        // 12 bayt (bytes 16..27)
+      return { salt, iv };
+    }
+
+    // PBKDF2 ile AES-GCM anahtar türetme, salt deterministik
+    async function deriveKeyDeterministic(secretPhrase) {
+      const { salt } = await deriveSaltAndIv(secretPhrase);
+      const enc = new TextEncoder();
+      const passKey = await crypto.subtle.importKey(
+        'raw',
+        enc.encode(secretPhrase),
+        'PBKDF2',
+        false,
+        ['deriveKey']
+      );
+      // Iterasyon sayısı 150000 (güçlü ama performans etkisi var)
+      return await crypto.subtle.deriveKey(
+        {
+          name: 'PBKDF2',
+          salt: salt,
+          iterations: 150000,
+          hash: 'SHA-256'
+        },
+        passKey,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+      );
+    }
+
+    // Deterministik AES-GCM şifreleme: sabit IV
+    async function encryptDeterministicAES(realPassword, secretPhrase) {
+      const key = await deriveKeyDeterministic(secretPhrase);
+      const { iv } = await deriveSaltAndIv(secretPhrase);
+      const enc = new TextEncoder();
+      // AES-GCM encrypt
+      const cipherBuf = await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv: iv },
+        key,
+        enc.encode(realPassword)
+      );
+      // Dönen ArrayBuffer'ı Base64'e çevir
+      return arrayBufferToBase64(cipherBuf);
+    }
+
+    // Deterministik AES-GCM deşifreleme: sabit IV
+    async function decryptDeterministicAES(ciphertextBase64, secretPhrase) {
+      try {
+        const key = await deriveKeyDeterministic(secretPhrase);
+        const { iv } = await deriveSaltAndIv(secretPhrase);
+        const cipherBuf = base64ToArrayBuffer(ciphertextBase64.trim());
+        const plainBuf = await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: iv },
+          key,
+          cipherBuf
+        );
+        const dec = new TextDecoder();
+        return dec.decode(plainBuf);
+      } catch (e) {
+        throw new Error('Şifre çözme başarısız: ' + e.message);
+      }
+    }
+
+    // DOM elemanları
+    const secretPhraseInput = document.getElementById('secretPhrase');
+    const realPasswordInput = document.getElementById('realPassword');
+    const encryptBtn = document.getElementById('encryptBtn');
+    const encryptStatus = document.getElementById('encryptStatus');
+    const outputEncrypted = document.getElementById('outputEncrypted');
+    const qrCanvas = document.getElementById('qrCanvas');
+    const qrError = document.getElementById('qrError');
+    const downloadArea = document.getElementById('downloadArea');
+
+    const encryptedInput = document.getElementById('encryptedInput');
+    const secretPhraseDecryptInput = document.getElementById('secretPhraseDecrypt');
+    const decryptBtn = document.getElementById('decryptBtn');
+    const decryptStatus = document.getElementById('decryptStatus');
+    const outputDecrypted = document.getElementById('outputDecrypted');
+
+    // Şifrele butonu eventi
+    encryptBtn.addEventListener('click', async () => {
+      encryptStatus.textContent = '';
+      outputEncrypted.textContent = '';
+      qrError.textContent = '';
+      downloadArea.innerHTML = '';
+      qrCanvas.style.display = 'none';
+
+      const secretPhrase = secretPhraseInput.value;
+      const realPassword = realPasswordInput.value;
+      if (!secretPhrase) {
+        encryptStatus.textContent = 'Lütfen gizli cümleyi girin.';
+        return;
+      }
+      if (!realPassword) {
+        encryptStatus.textContent = 'Lütfen gerçek şifrenizi girin.';
+        return;
+      }
+      outputEncrypted.textContent = 'Deterministik şifreleniyor... Lütfen bekleyin.';
+      try {
+        const ciphertextBase64 = await encryptDeterministicAES(realPassword, secretPhrase);
+        outputEncrypted.textContent = ciphertextBase64;
+
+        // QR oluşturma (opsiyonel)
+        if (window.QRious) {
+          try {
+            qrCanvas.style.display = 'block';
+            qrCanvas.width = 200;
+            qrCanvas.height = 200;
+            new QRious({
+              element: qrCanvas,
+              value: ciphertextBase64,
+              size: 200
+            });
+          } catch (e) {
+            qrError.textContent = 'QR oluşturulamadı (ciphertext uzun olabilir): ' + e.message;
+          }
+        }
+        // Dosya indir linki: ciphertext’i .txt olarak indir
+        const blob = new Blob([ciphertextBase64], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'ciphertext.txt';
+        a.textContent = '🔽 Şifrelenmiş metni dosya olarak indir';
+        a.className = 'download-link';
+        downloadArea.appendChild(a);
+
+        // Bilgi notu: Aynı girdilerle bu çıktı her seferinde aynı olacaktır.
+      } catch (e) {
+        outputEncrypted.textContent = '';
+        encryptStatus.textContent = 'Hata: ' + e.message;
+      }
+    });
+
+    // Şifre çöz butonu eventi
+    decryptBtn.addEventListener('click', async () => {
+      decryptStatus.textContent = '';
+      outputDecrypted.textContent = '';
+      const ciphertextBase64 = encryptedInput.value;
+      const secretPhrase = secretPhraseDecryptInput.value;
+      if (!ciphertextBase64) {
+        decryptStatus.textContent = 'Lütfen şifrelenmiş metni girin.';
+        return;
+      }
+      if (!secretPhrase) {
+        decryptStatus.textContent = 'Lütfen gizli cümleyi girin.';
+        return;
+      }
+      outputDecrypted.textContent = 'Deterministik deşifreleniyor... Lütfen bekleyin.';
+      try {
+        const realPassword = await decryptDeterministicAES(ciphertextBase64, secretPhrase);
+        outputDecrypted.textContent = realPassword;
+      } catch (e) {
+        outputDecrypted.textContent = '';
+        decryptStatus.textContent = 'Hata: ' + e.message;
+      }
+    });
+  </script>
+</body>
+</html>
